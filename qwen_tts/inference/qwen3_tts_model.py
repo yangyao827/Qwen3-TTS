@@ -640,8 +640,10 @@ class Qwen3TTSModel:
         instruct: Union[str, List[str]],
         language: Union[str, List[str]] = None,
         non_streaming_mode: bool = True,
+        prompt_codes: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
+        prompt_text: Optional[Union[List[str], str]] = None,
         **kwargs,
-    ) -> Tuple[List[np.ndarray], int]:
+    ) -> Union[Tuple[List[np.ndarray], int], Tuple[List[np.ndarray], int, List[torch.Tensor]]]:
         """
         Generate speech with the VoiceDesign model using natural-language style instructions.
 
@@ -655,6 +657,12 @@ class Qwen3TTSModel:
             non_streaming_mode:
                 Using non-streaming text input, this option currently only simulates streaming text input when set to `false`, 
                 rather than enabling true streaming input or streaming generation.
+            prompt_codes:
+                Optional tensor(s) representing previously generated talker codes to be used as a prompt (ICL).
+                This allows reusing a generated voice.
+            prompt_text:
+                Optional string(s) representing the text that generated the prompt_codes.
+                Required if prompt_codes is provided (for ICL context).
             do_sample:
                 Whether to use sampling, recommended to be set to `true` for most use cases.
             top_k:
@@ -675,6 +683,8 @@ class Qwen3TTSModel:
                 Temperature for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
             max_new_tokens:
                 Maximum number of new codec tokens to generate.
+            return_codes (bool):
+                If True, returns (wavs, fs, talker_codes_list). Default False.
             **kwargs:
                 Any other keyword arguments supported by HuggingFace Transformers `generate()` can be passed.
                 They will be forwarded to the underlying `Qwen3TTSForConditionalGeneration.generate(...)`.
@@ -682,6 +692,7 @@ class Qwen3TTSModel:
         Returns:
             Tuple[List[np.ndarray], int]:
                 (wavs, sample_rate)
+            OR Tuple[List[np.ndarray], int, List[torch.Tensor]] if return_codes=True
         """
         if self.model.tts_model_type != "voice_design":
             raise ValueError(
@@ -705,6 +716,40 @@ class Qwen3TTSModel:
 
         self._validate_languages(languages)
 
+        voice_clone_prompt_dict = None
+        ref_ids = None
+
+        if prompt_codes is not None:
+            if prompt_text is None:
+                raise ValueError("prompt_text is required when prompt_codes is provided.")
+            
+            prompt_codes_list = self._ensure_list(prompt_codes)
+            prompt_text_list = self._ensure_list(prompt_text)
+
+            if len(prompt_codes_list) == 1 and len(texts) > 1:
+                prompt_codes_list = prompt_codes_list * len(texts)
+            if len(prompt_text_list) == 1 and len(texts) > 1:
+                prompt_text_list = prompt_text_list * len(texts)
+
+            if len(prompt_codes_list) != len(texts) or len(prompt_text_list) != len(texts):
+                raise ValueError(f"Batch size mismatch: prompt_codes={len(prompt_codes_list)}, prompt_text={len(prompt_text_list)}, text={len(texts)}")
+            
+            voice_clone_prompt_dict = {
+                "ref_code": prompt_codes_list,
+                "ref_spk_embedding": [None] * len(prompt_codes_list),
+                "x_vector_only_mode": [False] * len(prompt_codes_list),
+                "icl_mode": [True] * len(prompt_codes_list)
+            }
+
+            ref_ids = []
+            for pt in prompt_text_list:
+                if pt is None or pt == "":
+                    # Should ideally not happen if prompt_codes is present, but safeguard
+                    ref_ids.append(None) 
+                else:
+                    ref_tok = self._tokenize_texts([self._build_ref_text(pt)])[0]
+                    ref_ids.append(ref_tok)
+
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
 
         instruct_ids: List[Optional[torch.Tensor]] = []
@@ -715,17 +760,46 @@ class Qwen3TTSModel:
                 instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        return_codes = gen_kwargs.pop("return_codes", False)
 
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
             instruct_ids=instruct_ids,
             languages=languages,
             non_streaming_mode=non_streaming_mode,
+            voice_clone_prompt=voice_clone_prompt_dict,
+            ref_ids=ref_ids,
             **gen_kwargs,
         )
 
         wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
+        
+        if return_codes:
+            return wavs, fs, talker_codes_list
         return wavs, fs
+    
+    def save_voice_design_prompt(self, path: str, talker_codes: torch.Tensor, instruct: str, text: str, language: str = None):
+        """
+        Save the generated voice design prompt (talker codes) to a file.
+        """
+        data = {
+            "talker_codes": talker_codes.cpu(),
+            "instruct": instruct,
+            "text": text,
+            "language": language
+        }
+        # Explicitly set weights_only=False to allow pickling complex objects and avoid FutureWarning
+        # We trust the data we are saving.
+        torch.save(data, path, _use_new_zipfile_serialization=False)
+
+    def load_voice_design_prompt(self, path: str) -> Dict[str, Any]:
+        """
+        Load a voice design prompt from a file.
+        """
+        # Explicitly set weights_only=False to allow unpickling complex objects and avoid FutureWarning
+        # The user is responsible for loading safe files.
+        data = torch.load(path, map_location=self.device, weights_only=False)
+        return data
 
     # custom voice model
     @torch.no_grad()

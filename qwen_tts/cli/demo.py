@@ -274,6 +274,12 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
 
     css = ".gradio-container {max-width: none !important;}"
 
+    import datetime
+
+    # Create SavedVoiceFile directory if it doesn't exist
+    SAVED_VOICE_DIR = os.path.join(os.getcwd(), "SavedVoiceFile")
+    os.makedirs(SAVED_VOICE_DIR, exist_ok=True)
+
     with gr.Blocks(theme=theme, css=css) as demo:
         gr.Markdown(
             f"""
@@ -337,6 +343,7 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
             btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
 
         elif model_kind == "voice_design":
+            last_codes_state = gr.State(None)
             with gr.Row():
                 with gr.Column(scale=2):
                     text_in = gr.Textbox(
@@ -356,30 +363,100 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         lines=3,
                         value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
                     )
-                    btn = gr.Button("Generate (生成)", variant="primary")
+                    import_file = gr.File(label="Import Voice File (导入音色文件)", file_types=[".pt"])
+                    
+                    with gr.Row():
+                        btn = gr.Button("Generate (生成)", variant="primary")
+                        save_btn = gr.Button("Save Current Voice (保存当前音色)")
+                
                 with gr.Column(scale=3):
                     audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
+                    save_file_out = gr.File(label="Saved Voice File (已保存音色文件)")
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_voice_design(text: str, lang_disp: str, design: str):
+            def run_voice_design(text: str, lang_disp: str, design: str, import_file_obj, state):
                 try:
                     if not text or not text.strip():
-                        return None, "Text is required (必须填写文本)."
-                    if not design or not design.strip():
-                        return None, "Voice design instruction is required (必须填写音色描述)."
+                        return None, "Text is required (必须填写文本).", state
+                    
+                    # If importing file, we don't necessarily need design instruction, but let's keep it consistent
+                    if (import_file_obj is None) and (not design or not design.strip()):
+                        return None, "Voice design instruction is required (必须填写音色描述) unless importing a voice file.", state
+                    
                     language = lang_map.get(lang_disp, "Auto")
                     kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_voice_design(
+                    
+                    prompt_codes = None
+                    prompt_text = None
+                    status_msg = "Finished. (生成完成)"
+
+                    if import_file_obj is not None:
+                        try:
+                            path = getattr(import_file_obj, "name", None) or getattr(import_file_obj, "path", None) or str(import_file_obj)
+                            data = tts.load_voice_design_prompt(path)
+                            if "talker_codes" in data:
+                                prompt_codes = data["talker_codes"]
+                                prompt_text = data.get("text", "") # Get the text that generated these codes
+                                status_msg = "Finished using imported voice (instruction ignored). (生成完成，已使用导入的音色，指令被忽略)"
+                            else:
+                                return None, "Invalid voice file format (音色文件格式错误).", state
+                        except Exception as e:
+                             return None, f"Failed to load voice file: {e}", state
+
+                    wavs, sr, codes_list = tts.generate_voice_design(
                         text=text.strip(),
                         language=language,
-                        instruct=design.strip(),
+                        instruct=(design.strip() if design else ""),
+                        prompt_codes=prompt_codes,
+                        prompt_text=prompt_text,
+                        return_codes=True,
                         **kwargs,
                     )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                    
+                    # Update state with the first sample's codes AND the text that generated it
+                    # We store a tuple: (codes, generating_text)
+                    new_state = (codes_list[0].cpu(), text.strip()) if codes_list else None
+                    
+                    return _wav_to_gradio_audio(wavs[0], sr), status_msg, new_state
                 except Exception as e:
-                    return None, f"{type(e).__name__}: {e}"
+                    import traceback
+                    traceback.print_exc()
+                    return None, f"{type(e).__name__}: {e}", state
 
-            btn.click(run_voice_design, inputs=[text_in, lang_in, design_in], outputs=[audio_out, err])
+            btn.click(
+                run_voice_design, 
+                inputs=[text_in, lang_in, design_in, import_file, last_codes_state], 
+                outputs=[audio_out, err, last_codes_state]
+            )
+            
+            def save_last_voice(state, design_text):
+                if state is None:
+                    return None, "No voice generated yet (尚未生成音色)."
+                
+                try:
+                    # Unpack state
+                    if isinstance(state, tuple):
+                        talker_codes, generating_text = state
+                    else:
+                        # Fallback for old state format or if something went wrong
+                        talker_codes = state
+                        generating_text = "" 
+
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"voice_design_{timestamp}.pt"
+                    out_path = os.path.join(SAVED_VOICE_DIR, filename)
+                    
+                    tts.save_voice_design_prompt(out_path, talker_codes, design_text, generating_text)
+                    # Return path for download, and also print the absolute path in status
+                    return out_path, f"Voice saved to: {out_path} (音色已保存到项目目录下的 SavedVoiceFile 文件夹)"
+                except Exception as e:
+                    return None, f"Failed to save voice: {e}"
+
+            save_btn.click(
+                save_last_voice,
+                inputs=[last_codes_state, design_in],
+                outputs=[save_file_out, err]
+            )
 
         else:  # voice_clone for base
             with gr.Tabs():

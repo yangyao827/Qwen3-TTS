@@ -1959,9 +1959,16 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         voice_clone_prompt: list[dict]
     ):
         voice_clone_spk_embeds = []
+        # check if ref_spk_embedding exists and is not None list
+        if "ref_spk_embedding" not in voice_clone_prompt or voice_clone_prompt["ref_spk_embedding"] is None:
+             return None
+
         for index in range(len(voice_clone_prompt['ref_spk_embedding'])):
-            ref_spk_embedding = voice_clone_prompt["ref_spk_embedding"][index].to(self.talker.device).to(self.talker.dtype)            
-            voice_clone_spk_embeds.append(ref_spk_embedding)
+            if voice_clone_prompt["ref_spk_embedding"][index] is not None:
+                ref_spk_embedding = voice_clone_prompt["ref_spk_embedding"][index].to(self.talker.device).to(self.talker.dtype)            
+                voice_clone_spk_embeds.append(ref_spk_embedding)
+            else:
+                voice_clone_spk_embeds.append(None)
         
         return voice_clone_spk_embeds
 
