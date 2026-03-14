@@ -272,7 +272,42 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
         font=[gr.themes.GoogleFont("Source Sans Pro"), "Arial", "sans-serif"],
     )
 
-    css = ".gradio-container {max-width: none !important;}"
+    theme = gr.themes.Soft(
+        font=[gr.themes.GoogleFont("Source Sans Pro"), "Arial", "sans-serif"],
+    )
+
+    # 替换原有的 css 变量
+    # 注入高级 CSS 以实现按钮悬浮定位
+    # 注入高级 CSS 以实现按钮悬浮定位和原生UI融合
+    css = """
+    .gradio-container {max-width: none !important;}
+    .audio-wrapper { position: relative; margin-bottom: 15px; }
+    button.save-icon-btn {
+        position: absolute !important;
+        top: 6px !important;       /* 向上微调，和右侧原生的框完全平齐 */
+        right: 60px !important;    /* 向右微调，紧贴在原生下载按钮左侧 */
+        width: 26px !important;
+        min-width: 26px !important;
+        height: 26px !important;
+        padding: 0 !important;
+        background: white !important;          /* 和原生一样的白色背景 */
+        border: 1px solid #e5e7eb !important;  /* 和原生一样的浅灰边框 */
+        border-radius: 6px !important;         /* 和原生一样的圆角 */
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
+        font-size: 14px !important;
+        z-index: 100 !important;
+        cursor: pointer !important;
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+        color: #4b5563 !important;
+    }
+    button.save-icon-btn:hover {
+        color: #2FA572 !important;
+        border-color: #2FA572 !important;
+        background: #f9fafb !important;
+    }
+    """
 
     import datetime
 
@@ -343,8 +378,6 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
             btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
 
         elif model_kind == "voice_design":
-            # State to store a list of (talker_codes, generating_text) for each generated output
-            # We will generate N outputs, so this state will hold a list of length N
             last_codes_state = gr.State([])
 
             with gr.Row():
@@ -367,7 +400,7 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
                     )
                     import_file = gr.File(label="Import Voice File (导入音色文件)", file_types=[".pt"])
-                    
+
                     num_outputs = gr.Slider(
                         label="Batch Size (生成数量)",
                         minimum=1,
@@ -377,59 +410,49 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     )
 
                     btn = gr.Button("Generate (生成)", variant="primary")
-                
+
                 with gr.Column(scale=3):
-                    # Create a container for dynamic outputs
                     output_components = []
-                    # We pre-create 10 rows (max batch size), initially hidden
+                    # 预生成 10 个音频位，并应用自定义的 CSS 容器
                     for i in range(10):
-                        with gr.Column(visible=False) as c:
+                        with gr.Column(visible=False, elem_classes="audio-wrapper") as c:
                             audio_out = gr.Audio(label=f"Output {i+1}", type="numpy", interactive=False)
-                            with gr.Row():
-                                with gr.Column(scale=1):
-                                    pass # Empty column for spacing
-                                save_btn = gr.Button(f"Save Voice {i+1}", size="sm", scale=0)
-                            save_file_out = gr.File(label="Saved File", visible=False) # Helper to show download
-                            
+                            # 绝对定位的图标按钮 💾
+                            save_btn = gr.Button("💾", elem_classes="save-icon-btn", elem_id=f"save-btn-{i}")
+
                             output_components.append({
                                 "col": c,
                                 "audio": audio_out,
                                 "save_btn": save_btn,
-                                "save_file": save_file_out,
                                 "index": i
                             })
-                    
+
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
             def run_voice_design_generator(text: str, lang_disp: str, design: str, import_file_obj, count: int):
-                # Clear previous outputs first (yield empty/hidden states)
-                # We yield updates for all 10 rows + err + state
-                # Initial clear
                 updates = []
                 for i in range(10):
                     updates.append(gr.update(visible=False)) # col
                     updates.append(gr.update(value=None))    # audio
-                    updates.append(gr.update(visible=False, value=None)) # save_file
-                
+
                 updates.append(gr.update(value="Generating...", visible=True)) # err
                 updates.append([]) # state reset
                 yield tuple(updates)
 
                 try:
                     if not text or not text.strip():
-                        # Error state
                         updates[-2] = "Text is required (必须填写文本)."
                         yield tuple(updates)
                         return
-                    
+
                     if (import_file_obj is None) and (not design or not design.strip()):
-                         updates[-2] = "Voice design instruction is required (必须填写音色描述) unless importing a voice file."
-                         yield tuple(updates)
-                         return
-                    
+                        updates[-2] = "Voice design instruction is required (必须填写音色描述) unless importing a voice file."
+                        yield tuple(updates)
+                        return
+
                     language = lang_map.get(lang_disp, "Auto")
                     kwargs = _gen_common_kwargs()
-                    
+
                     prompt_codes = None
                     prompt_text = None
                     status_prefix = ""
@@ -440,21 +463,19 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                             data = tts.load_voice_design_prompt(path)
                             if "talker_codes" in data:
                                 prompt_codes = data["talker_codes"]
-                                prompt_text = data.get("text", "") 
+                                prompt_text = data.get("text", "")
                                 status_prefix = "Using imported voice (instruction ignored). "
                             else:
                                 updates[-2] = "Invalid voice file format (音色文件格式错误)."
                                 yield tuple(updates)
                                 return
                         except Exception as e:
-                             updates[-2] = f"Failed to load voice file: {e}"
-                             yield tuple(updates)
-                             return
+                            updates[-2] = f"Failed to load voice file: {e}"
+                            yield tuple(updates)
+                            return
 
-                    # Current accumulated state
                     current_state = []
-                    
-                    # Loop to generate one by one
+
                     for i in range(count):
                         wavs, sr, codes_list = tts.generate_voice_design(
                             text=text.strip(),
@@ -465,25 +486,18 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                             return_codes=True,
                             **kwargs,
                         )
-                        
-                        # Store state: (talker_codes, generating_text)
+
                         item_state = (codes_list[0].cpu(), text.strip())
                         current_state.append(item_state)
 
-                        # Update UI for the i-th row
-                        # Index in updates list: 
-                        # col: i*3 + 0
-                        # audio: i*3 + 1
-                        # save_file: i*3 + 2
-                        updates[i*3 + 0] = gr.update(visible=True)
-                        updates[i*3 + 1] = gr.update(value=_wav_to_gradio_audio(wavs[0], sr))
-                        updates[i*3 + 2] = gr.update(visible=False, value=None) # Reset save file
+                        updates[i*2 + 0] = gr.update(visible=True)
+                        updates[i*2 + 1] = gr.update(value=_wav_to_gradio_audio(wavs[0], sr))
 
                         updates[-2] = f"{status_prefix}Generated {i+1}/{count}..."
-                        updates[-1] = current_state # Update state list
-                        
+                        updates[-1] = current_state
+
                         yield tuple(updates)
-                    
+
                     updates[-2] = f"{status_prefix}Finished. Generated {count} samples."
                     yield tuple(updates)
 
@@ -493,53 +507,52 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     updates[-2] = f"{type(e).__name__}: {e}"
                     yield tuple(updates)
 
-            # Collect outputs for the click event
-            # List structure: [col_0, audio_0, file_0, col_1, audio_1, file_1, ..., err, state]
             output_list = []
             for comp in output_components:
                 output_list.append(comp["col"])
                 output_list.append(comp["audio"])
-                output_list.append(comp["save_file"])
             output_list.append(err)
             output_list.append(last_codes_state)
 
             btn.click(
-                run_voice_design_generator, 
-                inputs=[text_in, lang_in, design_in, import_file, num_outputs], 
+                run_voice_design_generator,
+                inputs=[text_in, lang_in, design_in, import_file, num_outputs],
                 outputs=output_list
             )
-            
-            # Save handlers for each row
+
             def make_save_handler(idx):
                 def save_voice(state_list, design_text):
                     if not state_list or idx >= len(state_list):
-                        return None # Should not happen if button is visible
-                    
+                        gr.Warning("No data to save (没有可保存的音色数据).")
+                        return
+
                     item_state = state_list[idx]
-                    
+
                     try:
                         if isinstance(item_state, tuple):
                             talker_codes, generating_text = item_state
                         else:
                             talker_codes = item_state
-                            generating_text = "" 
+                            generating_text = ""
 
                         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"voice_design_{timestamp}_{idx+1}.pt"
                         out_path = os.path.join(SAVED_VOICE_DIR, filename)
-                        
+
                         tts.save_voice_design_prompt(out_path, talker_codes, design_text, generating_text)
-                        return gr.update(visible=True, value=out_path)
+
+                        # 核心特性：使用原生的屏幕右上角 Toast 弹窗通知保存成功
+                        gr.Info(f"💾 音色已成功保存！\n路径: {out_path}", duration=4)
                     except Exception as e:
                         print(f"Failed to save: {e}")
-                        return None
+                        gr.Warning(f"保存失败: {e}")
                 return save_voice
 
             for i, comp in enumerate(output_components):
                 comp["save_btn"].click(
                     make_save_handler(i),
                     inputs=[last_codes_state, design_in],
-                    outputs=[comp["save_file"]]
+                    outputs=[] # 去掉文件输出框，纯使用弹窗提示
                 )
 
         else:  # voice_clone for base
